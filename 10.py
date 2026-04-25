@@ -332,26 +332,55 @@ def download_pdf_file(
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     last_exception: Exception | None = None
+    chunk_size: int = 1024 * 1024
 
     for attempt in range(1, retry + 1):
+        temp_path = output_path.with_suffix(output_path.suffix + ".part")
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
         try:
-            response = session.get(pdf_url, timeout=60)
-            if response.status_code == 200:
-                output_path.write_bytes(response.content)
-                return "ok"
-            if response.status_code in {401, 403}:
-                return f"forbidden_{response.status_code}"
-            if response.status_code == 404:
-                return "not_found"
-            LOGGER.warning(
-                "Download failed (%s), attempt %d/%d: %s",
-                response.status_code,
-                attempt,
-                retry,
+            with session.get(
                 pdf_url,
-            )
-        except requests.RequestException as exc:
+                stream=True,
+                timeout=(30, 600),
+            ) as response:
+                if response.status_code in {401, 403}:
+                    return f"forbidden_{response.status_code}"
+                if response.status_code == 404:
+                    return "not_found"
+                if response.status_code != 200:
+                    LOGGER.warning(
+                        "Download failed (%s), attempt %d/%d: %s",
+                        response.status_code,
+                        attempt,
+                        retry,
+                        pdf_url,
+                    )
+                    continue
+
+                expected_len: int | None = None
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None and str(content_length).isdigit():
+                    expected_len = int(content_length)
+
+                bytes_written = 0
+                with temp_path.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            handle.write(chunk)
+                            bytes_written += len(chunk)
+
+                if expected_len is not None and bytes_written != expected_len:
+                    raise ValueError(
+                        f"Incomplete download: got {bytes_written} bytes, expected {expected_len}"
+                    )
+
+            temp_path.replace(output_path)
+            return "ok"
+        except (requests.RequestException, ValueError, OSError) as exc:
             last_exception = exc
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
             LOGGER.warning("Download exception attempt %d/%d: %s", attempt, retry, exc)
 
         if attempt < retry and sleep_seconds > 0:
