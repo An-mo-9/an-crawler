@@ -21,6 +21,8 @@ import requests
 LOGGER = logging.getLogger(__name__)
 OPENREVIEW_API_BASE = "https://api2.openreview.net"
 OPENREVIEW_WEB_BASE = "https://openreview.net"
+API_MAX_RETRIES = 5
+API_BASE_BACKOFF_SECONDS = 1.5
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,7 @@ class CrawlConfig:
         mapping_output: Optional path to save paper-text/pdf mapping JSONL.
         per_status: Optional sample count per status bucket.
         per_tab: Optional sample count per OpenReview tab bucket.
+        ratings_only_output: Optional JSONL path for flattened rating records.
     """
 
     year: int
@@ -52,6 +55,7 @@ class CrawlConfig:
     mapping_output: Path | None = None
     per_status: int | None = None
     per_tab: int | None = None
+    ratings_only_output: Path | None = None
 
 
 def create_session() -> requests.Session:
@@ -86,9 +90,25 @@ def get_json(session: requests.Session, endpoint: str, params: dict[str, Any]) -
         ValueError: If response cannot be decoded as JSON.
     """
     url: str = f"{OPENREVIEW_API_BASE}{endpoint}"
-    response = session.get(url, params=params, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(1, API_MAX_RETRIES + 1):
+        try:
+            response = session.get(url, params=params, timeout=(30, 180))
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError) as exc:
+            if attempt >= API_MAX_RETRIES:
+                raise
+            sleep_seconds = API_BASE_BACKOFF_SECONDS * attempt
+            LOGGER.warning(
+                "API request failed attempt %d/%d for %s: %s. Retrying in %.1fs",
+                attempt,
+                API_MAX_RETRIES,
+                endpoint,
+                exc,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+    return {}
 
 
 def get_group_content_value(session: requests.Session, group_id: str, key: str) -> str | None:
@@ -164,6 +184,23 @@ def paged_notes(
         offset += len(notes)
         LOGGER.info("Fetched %d notes from %s", len(all_notes), invitation)
     return all_notes
+
+
+def fetch_note_with_replies(session: requests.Session, note_id: str) -> dict[str, Any] | None:
+    """Fetch one note with details=replies.
+
+    Args:
+        session: HTTP session.
+        note_id: Note identifier.
+
+    Returns:
+        Note with replies if found, else None.
+    """
+    payload = get_json(session, "/notes", params={"id": note_id, "details": "replies"})
+    notes = payload.get("notes", [])
+    if isinstance(notes, list) and notes:
+        return notes[0]
+    return None
 
 
 def extract_score(content: dict[str, Any]) -> str | None:
@@ -865,7 +902,7 @@ def fetch_submissions_by_openreview_tabs(
             notes = paged_notes(
                 session=session,
                 invitation=submission_invitation,
-                details="replies",
+                details=None,
                 page_size=page_size,
                 max_items=remaining,
                 extra_params=filter_params,
@@ -884,7 +921,7 @@ def fetch_submissions_by_openreview_tabs(
     recent_activity = paged_notes(
         session=session,
         invitation=submission_invitation,
-        details="replies",
+        details=None,
         page_size=page_size,
         max_items=None if is_unbounded else per_tab,
         extra_params={"sort": "tmdate:desc"},
@@ -1061,107 +1098,182 @@ def crawl_iclr_by_tabs(config: CrawlConfig) -> dict[str, list[dict[str, Any]]]:
     for tab_name, submissions in tab_submissions.items():
         papers: list[dict[str, Any]] = []
         for submission in submissions:
-            forum_id = str(submission.get("forum", ""))
-            normalized_submission_content = normalize_content(submission.get("content", {}))
-            pdf_url = extract_pdf_url(normalized_submission_content)
-            pdf_local_path: str | None = None
-            pdf_download_status: str | None = None
-            if config.download_pdf and pdf_url is not None:
-                paper_id = str(submission.get("id", forum_id or "paper_unknown"))
-                target_path = config.pdf_dir / f"{paper_id}.pdf"
-                pdf_download_status = download_pdf_file(
-                    session=session,
-                    pdf_url=pdf_url,
-                    output_path=target_path,
-                    retry=config.retry,
-                    sleep_seconds=config.sleep_seconds,
-                )
-                pdf_local_path = target_path.as_posix()
-                if config.sleep_seconds > 0:
-                    time.sleep(config.sleep_seconds)
-
-            details = submission.get("details", {})
-            replies = details.get("replies", [])
-            if not isinstance(replies, list):
-                replies = []
-            reviews, comments = split_replies_by_type(replies)
-            editorial_signals = extract_editorial_signals(replies)
-            discussion_views = build_discussion_views(replies)
-            status, decision_text = get_submission_status(submission)
-            papers.append(
-                {
-                    "tab": tab_name,
-                    "paper_id": submission.get("id"),
-                    "forum_id": forum_id,
-                    "number": submission.get("number"),
-                    "title": normalized_submission_content.get("title"),
-                    "abstract": normalized_submission_content.get("abstract"),
-                    "keywords": normalized_submission_content.get("keywords"),
-                    "decision": decision_text,
-                    "status": status,
-                    "pdf_url": pdf_url,
-                    "pdf_local_path": pdf_local_path,
-                    "pdf_download_status": pdf_download_status,
-                    "submission_content": normalized_submission_content,
-                    "editorial_signals": editorial_signals,
-                    "all_replies": discussion_views["all_replies"],
-                    "author_responses": discussion_views["author_responses"],
-                    "meta_reviews": discussion_views["meta_reviews"],
-                    "review_notes": discussion_views["review_notes"],
-                    "reviews": [
-                        {
-                            "id": note.get("id"),
-                            "forum": note.get("forum"),
-                            "replyto": note.get("replyto"),
-                            "invitation": note.get("invitation"),
-                            "score": extract_score(note.get("content", {})),
-                            "soundness_score": extract_content_field(note.get("content", {}), "soundness"),
-                            "soundness": describe_review_metric(
-                                "soundness", extract_content_field(note.get("content", {}), "soundness")
-                            ),
-                            "presentation_score": extract_content_field(note.get("content", {}), "presentation"),
-                            "presentation": describe_review_metric(
-                                "presentation", extract_content_field(note.get("content", {}), "presentation")
-                            ),
-                            "contribution_score": extract_content_field(note.get("content", {}), "contribution"),
-                            "contribution": describe_review_metric(
-                                "contribution", extract_content_field(note.get("content", {}), "contribution")
-                            ),
-                            "rating_score": extract_content_field(note.get("content", {}), "rating"),
-                            "rating": describe_review_metric(
-                                "rating", extract_content_field(note.get("content", {}), "rating")
-                            ),
-                            "confidence_score": extract_content_field(note.get("content", {}), "confidence"),
-                            "confidence": describe_review_metric(
-                                "confidence", extract_content_field(note.get("content", {}), "confidence")
-                            ),
-                            "raw_content": enrich_metric_descriptions(
-                                normalize_content(note.get("content", {}))
-                            ),
-                            "content": enrich_metric_descriptions(
-                                normalize_content(note.get("content", {}))
-                            ),
-                            "tcdate": note.get("tcdate"),
-                        }
-                        for note in reviews
-                    ],
-                    "comments": [
-                        {
-                            "id": note.get("id"),
-                            "forum": note.get("forum"),
-                            "replyto": note.get("replyto"),
-                            "invitation": note.get("invitation"),
-                            "content": enrich_metric_descriptions(
-                                normalize_content(note.get("content", {}))
-                            ),
-                            "tcdate": note.get("tcdate"),
-                        }
-                        for note in comments
-                    ],
-                }
-            )
+            papers.append(build_tab_paper_record(session, submission, tab_name, config))
         tab_papers[tab_name] = papers
     return tab_papers
+
+
+def build_tab_paper_record(
+    session: requests.Session,
+    submission: dict[str, Any],
+    tab_name: str,
+    config: CrawlConfig,
+) -> dict[str, Any]:
+    """Build one paper record for tab-based crawling.
+
+    Args:
+        session: HTTP session.
+        submission: Submission note.
+        tab_name: Tab bucket name.
+        config: Crawl config.
+
+    Returns:
+        One paper record.
+    """
+    note_id = str(submission.get("id", ""))
+    if "details" not in submission and note_id:
+        hydrated = fetch_note_with_replies(session, note_id)
+        if hydrated is not None:
+            submission = hydrated
+    forum_id = str(submission.get("forum", ""))
+    normalized_submission_content = normalize_content(submission.get("content", {}))
+    pdf_url = extract_pdf_url(normalized_submission_content)
+    pdf_local_path: str | None = None
+    pdf_download_status: str | None = None
+    if config.download_pdf and pdf_url is not None:
+        paper_id = str(submission.get("id", forum_id or "paper_unknown"))
+        target_path = config.pdf_dir / f"{paper_id}.pdf"
+        pdf_download_status = download_pdf_file(
+            session=session,
+            pdf_url=pdf_url,
+            output_path=target_path,
+            retry=config.retry,
+            sleep_seconds=config.sleep_seconds,
+        )
+        pdf_local_path = target_path.as_posix()
+        if config.sleep_seconds > 0:
+            time.sleep(config.sleep_seconds)
+
+    details = submission.get("details", {})
+    replies = details.get("replies", [])
+    if not isinstance(replies, list):
+        replies = []
+    reviews, comments = split_replies_by_type(replies)
+    editorial_signals = extract_editorial_signals(replies)
+    discussion_views = build_discussion_views(replies)
+    status, decision_text = get_submission_status(submission)
+    return {
+        "tab": tab_name,
+        "paper_id": submission.get("id"),
+        "forum_id": forum_id,
+        "number": submission.get("number"),
+        "title": normalized_submission_content.get("title"),
+        "abstract": normalized_submission_content.get("abstract"),
+        "keywords": normalized_submission_content.get("keywords"),
+        "decision": decision_text,
+        "status": status,
+        "pdf_url": pdf_url,
+        "pdf_local_path": pdf_local_path,
+        "pdf_download_status": pdf_download_status,
+        "submission_content": normalized_submission_content,
+        "editorial_signals": editorial_signals,
+        "all_replies": discussion_views["all_replies"],
+        "author_responses": discussion_views["author_responses"],
+        "meta_reviews": discussion_views["meta_reviews"],
+        "review_notes": discussion_views["review_notes"],
+        "reviews": [
+            {
+                "id": note.get("id"),
+                "forum": note.get("forum"),
+                "replyto": note.get("replyto"),
+                "invitation": note.get("invitation"),
+                "score": extract_score(note.get("content", {})),
+                "soundness_score": extract_content_field(note.get("content", {}), "soundness"),
+                "soundness": describe_review_metric(
+                    "soundness", extract_content_field(note.get("content", {}), "soundness")
+                ),
+                "presentation_score": extract_content_field(note.get("content", {}), "presentation"),
+                "presentation": describe_review_metric(
+                    "presentation", extract_content_field(note.get("content", {}), "presentation")
+                ),
+                "contribution_score": extract_content_field(note.get("content", {}), "contribution"),
+                "contribution": describe_review_metric(
+                    "contribution", extract_content_field(note.get("content", {}), "contribution")
+                ),
+                "rating_score": extract_content_field(note.get("content", {}), "rating"),
+                "rating": describe_review_metric(
+                    "rating", extract_content_field(note.get("content", {}), "rating")
+                ),
+                "confidence_score": extract_content_field(note.get("content", {}), "confidence"),
+                "confidence": describe_review_metric(
+                    "confidence", extract_content_field(note.get("content", {}), "confidence")
+                ),
+                "raw_content": enrich_metric_descriptions(
+                    normalize_content(note.get("content", {}))
+                ),
+                "content": enrich_metric_descriptions(
+                    normalize_content(note.get("content", {}))
+                ),
+                "tcdate": note.get("tcdate"),
+            }
+            for note in reviews
+        ],
+        "comments": [
+            {
+                "id": note.get("id"),
+                "forum": note.get("forum"),
+                "replyto": note.get("replyto"),
+                "invitation": note.get("invitation"),
+                "content": enrich_metric_descriptions(
+                    normalize_content(note.get("content", {}))
+                ),
+                "tcdate": note.get("tcdate"),
+            }
+            for note in comments
+        ],
+    }
+
+
+def crawl_iclr_by_tabs_stream(
+    config: CrawlConfig,
+    output_path: Path,
+    mapping_output: Path | None = None,
+    ratings_only_output: Path | None = None,
+) -> dict[str, int]:
+    """Stream tab-based papers directly into JSONL outputs.
+
+    Args:
+        config: Crawl configuration.
+        output_path: JSONL output path for paper records.
+        mapping_output: Optional JSONL output path for mapping records.
+        ratings_only_output: Optional JSONL path for flattened rating records.
+
+    Returns:
+        Tab counts.
+    """
+    venue_id: str = f"ICLR.cc/{config.year}/Conference"
+    session = create_session()
+    tab_submissions = fetch_submissions_by_openreview_tabs(
+        session=session,
+        venue_id=venue_id,
+        per_tab=config.per_tab if config.per_tab is not None else 0,
+        page_size=config.page_size,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if mapping_output is not None:
+        mapping_output.parent.mkdir(parents=True, exist_ok=True)
+    if ratings_only_output is not None:
+        ratings_only_output.parent.mkdir(parents=True, exist_ok=True)
+
+    tab_counts: dict[str, int] = {}
+    with output_path.open("w", encoding="utf-8") as out_f:
+        map_f = mapping_output.open("w", encoding="utf-8") if mapping_output is not None else None
+        try:
+            for tab_name, submissions in tab_submissions.items():
+                tab_counts[tab_name] = 0
+                for submission in submissions:
+                    paper = build_tab_paper_record(session, submission, tab_name, config)
+                    out_f.write(json.dumps(paper, ensure_ascii=False) + "\n")
+                    if map_f is not None:
+                        map_f.write(json.dumps(build_pdf_text_mapping_record(paper), ensure_ascii=False) + "\n")
+                    if ratings_only_output is not None:
+                        append_jsonl_records(ratings_only_output, build_rating_records(paper))
+                    tab_counts[tab_name] += 1
+                LOGGER.info("Streamed %d papers for tab %s", tab_counts[tab_name], tab_name)
+        finally:
+            if map_f is not None:
+                map_f.close()
+    return tab_counts
 
 
 def build_pdf_text_mapping_record(paper: dict[str, Any]) -> dict[str, Any]:
@@ -1206,6 +1318,46 @@ def build_pdf_text_mapping_record(paper: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_rating_records(paper: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build flattened rating records from one paper.
+
+    Args:
+        paper: Paper record.
+
+    Returns:
+        List of rating-centric records (one per review with rating).
+    """
+    records: list[dict[str, Any]] = []
+    for review in paper.get("reviews", []):
+        rating = review.get("rating")
+        rating_score = review.get("rating_score")
+        if rating is None and rating_score is None:
+            continue
+        records.append(
+            {
+                "tab": paper.get("tab"),
+                "paper_id": paper.get("paper_id"),
+                "forum_id": paper.get("forum_id"),
+                "title": paper.get("title"),
+                "review_id": review.get("id"),
+                "invitation": review.get("invitation"),
+                "rating": rating,
+                "rating_score": rating_score,
+                "confidence": review.get("confidence"),
+                "confidence_score": review.get("confidence_score"),
+                "soundness": review.get("soundness"),
+                "soundness_score": review.get("soundness_score"),
+                "presentation": review.get("presentation"),
+                "presentation_score": review.get("presentation_score"),
+                "contribution": review.get("contribution"),
+                "contribution_score": review.get("contribution_score"),
+                "score": review.get("score"),
+                "tcdate": review.get("tcdate"),
+            }
+        )
+    return records
+
+
 def write_mapping_jsonl(mapping_output: Path, papers: list[dict[str, Any]]) -> None:
     """Write one-json-per-line mapping file for downstream processing.
 
@@ -1230,6 +1382,21 @@ def write_papers_jsonl(output_path: Path, papers: list[dict[str, Any]]) -> None:
     output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
+def append_jsonl_records(output_path: Path, records: list[dict[str, Any]]) -> None:
+    """Append records to a JSONL file.
+
+    Args:
+        output_path: Target JSONL path.
+        records: Records to append.
+    """
+    if not records:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def parse_args() -> CrawlConfig:
     """Parse CLI arguments.
 
@@ -1247,8 +1414,8 @@ def parse_args() -> CrawlConfig:
     parser.add_argument(
         "--page-size",
         type=int,
-        default=1000,
-        help="OpenReview API page size (default: 1000).",
+        default=100,
+        help="OpenReview API page size (default: 100).",
     )
     parser.add_argument(
         "--max-papers",
@@ -1301,6 +1468,12 @@ def parse_args() -> CrawlConfig:
             "Use 0 for all papers in each tab."
         ),
     )
+    parser.add_argument(
+        "--ratings-only-output",
+        type=Path,
+        default=None,
+        help="Optional JSONL path to output flattened rating records only.",
+    )
     args = parser.parse_args()
     return CrawlConfig(
         year=args.year,
@@ -1314,6 +1487,7 @@ def parse_args() -> CrawlConfig:
         mapping_output=args.mapping_output,
         per_status=args.per_status,
         per_tab=args.per_tab,
+        ratings_only_output=args.ratings_only_output,
     )
 
 
@@ -1322,13 +1496,24 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     config = parse_args()
     if config.per_tab is not None:
-        tab_papers = crawl_iclr_by_tabs(config)
-        total_count = sum(len(items) for items in tab_papers.values())
-        flat_papers = [paper for papers in tab_papers.values() for paper in papers]
         if config.output.suffix.lower() == ".jsonl":
-            write_papers_jsonl(config.output, flat_papers)
-            LOGGER.info("Saved %d tab-grouped papers as JSONL to %s", total_count, config.output.as_posix())
+            tab_counts = crawl_iclr_by_tabs_stream(
+                config=config,
+                output_path=config.output,
+                mapping_output=config.mapping_output,
+                ratings_only_output=config.ratings_only_output,
+            )
+            total_count = sum(tab_counts.values())
+            LOGGER.info(
+                "Streamed %d tab-grouped papers as JSONL to %s",
+                total_count,
+                config.output.as_posix(),
+            )
+            LOGGER.info("Tab counts: %s", tab_counts)
         else:
+            tab_papers = crawl_iclr_by_tabs(config)
+            total_count = sum(len(items) for items in tab_papers.values())
+            flat_papers = [paper for papers in tab_papers.values() for paper in papers]
             config.output.write_text(
                 json.dumps(
                     {
@@ -1343,9 +1528,15 @@ def main() -> None:
                 encoding="utf-8",
             )
             LOGGER.info("Saved %d tab-grouped papers to %s", total_count, config.output.as_posix())
-        if config.mapping_output is not None:
-            write_mapping_jsonl(config.mapping_output, flat_papers)
-            LOGGER.info("Saved mapping JSONL to %s", config.mapping_output.as_posix())
+            if config.mapping_output is not None:
+                write_mapping_jsonl(config.mapping_output, flat_papers)
+                LOGGER.info("Saved mapping JSONL to %s", config.mapping_output.as_posix())
+            if config.ratings_only_output is not None:
+                rating_records = []
+                for paper in flat_papers:
+                    rating_records.extend(build_rating_records(paper))
+                write_papers_jsonl(config.ratings_only_output, rating_records)
+                LOGGER.info("Saved %d rating records to %s", len(rating_records), config.ratings_only_output.as_posix())
         return
 
     papers = crawl_iclr(config)
@@ -1364,6 +1555,12 @@ def main() -> None:
     if config.mapping_output is not None:
         write_mapping_jsonl(config.mapping_output, papers)
         LOGGER.info("Saved mapping JSONL to %s", config.mapping_output.as_posix())
+    if config.ratings_only_output is not None:
+        rating_records = []
+        for paper in papers:
+            rating_records.extend(build_rating_records(paper))
+        write_papers_jsonl(config.ratings_only_output, rating_records)
+        LOGGER.info("Saved %d rating records to %s", len(rating_records), config.ratings_only_output.as_posix())
     LOGGER.info("Saved %d papers to %s", len(papers), config.output.as_posix())
 
 
