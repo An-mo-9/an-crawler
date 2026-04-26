@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,8 @@ class CrawlConfig:
         sleep_seconds: Sleep interval between requests/downloads.
         retry: Number of retries for PDF download.
         mapping_output: Optional path to save paper-text/pdf mapping JSONL.
+        per_status: Optional sample count per status bucket.
+        per_tab: Optional sample count per OpenReview tab bucket.
     """
 
     year: int
@@ -47,6 +50,8 @@ class CrawlConfig:
     sleep_seconds: float = 0.0
     retry: int = 3
     mapping_output: Path | None = None
+    per_status: int | None = None
+    per_tab: int | None = None
 
 
 def create_session() -> requests.Session:
@@ -86,6 +91,30 @@ def get_json(session: requests.Session, endpoint: str, params: dict[str, Any]) -
     return response.json()
 
 
+def get_group_content_value(session: requests.Session, group_id: str, key: str) -> str | None:
+    """Get one value from OpenReview group content.
+
+    Args:
+        session: HTTP session.
+        group_id: Group id.
+        key: Content key.
+
+    Returns:
+        Group content value if found, else None.
+    """
+    payload = get_json(session, "/groups", params={"id": group_id})
+    groups = payload.get("groups", [])
+    if not groups:
+        return None
+    content = groups[0].get("content", {})
+    raw_value = content.get(key)
+    if isinstance(raw_value, dict) and "value" in raw_value:
+        value = raw_value["value"]
+    else:
+        value = raw_value
+    return str(value) if value is not None else None
+
+
 def paged_notes(
     session: requests.Session,
     invitation: str,
@@ -93,6 +122,7 @@ def paged_notes(
     details: str | None = None,
     page_size: int = 1000,
     max_items: int | None = None,
+    extra_params: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch all notes for a given invitation with pagination.
 
@@ -102,6 +132,7 @@ def paged_notes(
         details: Optional details expansion, e.g. "replies".
         page_size: Number of notes per page.
         max_items: Optional hard cap on returned note count.
+        extra_params: Optional additional query parameters.
 
     Returns:
         List of note objects.
@@ -121,6 +152,8 @@ def paged_notes(
             "offset": offset,
             "sort": "number:asc",
         }
+        if extra_params:
+            params.update(extra_params)
         if details:
             params["details"] = details
         payload = get_json(session, "/notes", params=params)
@@ -305,10 +338,42 @@ def extract_pdf_url(submission_content: dict[str, Any]) -> str | None:
     """
     pdf_value = submission_content.get("pdf")
     if not isinstance(pdf_value, str) or not pdf_value.strip():
+        # Fallback: some notes embed PDF URL inside markdown text fields.
+        text_fields: tuple[str, ...] = ("article", "comment", "summary", "abstract")
+        for field_name in text_fields:
+            field_value = submission_content.get(field_name)
+            if not isinstance(field_value, str):
+                continue
+            pdf_url = extract_pdf_url_from_text(field_value)
+            if pdf_url is not None:
+                return pdf_url
         return None
     if pdf_value.startswith("http://") or pdf_value.startswith("https://"):
         return pdf_value
     return urljoin(f"{OPENREVIEW_WEB_BASE}/", pdf_value.lstrip("/"))
+
+
+def extract_pdf_url_from_text(text: str) -> str | None:
+    """Extract a PDF URL from free-form markdown/plain text.
+
+    Args:
+        text: Text potentially containing URLs.
+
+    Returns:
+        First matched PDF URL, else None.
+    """
+    url_pattern = re.compile(r"https?://[^\s\)\]]+")
+    for match in url_pattern.findall(text):
+        candidate = match.strip(".,;:!\"'")
+        lower_candidate = candidate.lower()
+        if lower_candidate.endswith(".pdf"):
+            return candidate
+        if "arxiv.org/abs/" in lower_candidate:
+            # Normalize arXiv abstract URLs to direct PDF URLs.
+            return re.sub(r"arxiv\.org/abs/([^?#]+)", r"arxiv.org/pdf/\1.pdf", candidate)
+        if "arxiv.org/pdf/" in lower_candidate:
+            return candidate if lower_candidate.endswith(".pdf") else f"{candidate}.pdf"
+    return None
 
 
 def download_pdf_file(
@@ -557,6 +622,281 @@ def extract_editorial_signals(replies: list[dict[str, Any]]) -> dict[str, Any]:
     return extracted
 
 
+def extract_decision_text_from_replies(replies: list[dict[str, Any]]) -> str | None:
+    """Extract decision text from reply notes if available.
+
+    Args:
+        replies: Replies under one submission forum.
+
+    Returns:
+        Decision text if found, else None.
+    """
+    decision_markers: tuple[str, ...] = ("decision", "meta_review", "metareview")
+    for note in replies:
+        invitation = str(note.get("invitation", "")).lower()
+        if not any(marker in invitation for marker in decision_markers):
+            continue
+        content = note.get("content", {})
+        if not isinstance(content, dict):
+            continue
+        for key in ("decision", "final_decision", "recommendation", "verdict"):
+            value = extract_content_field(content, key)
+            if value is not None:
+                return str(value)
+    return None
+
+
+def classify_submission_status(decision_text: str | None) -> str:
+    """Classify submission status from decision text.
+
+    Args:
+        decision_text: Decision text extracted from notes.
+
+    Returns:
+        One of oral/poster/reject/withdrawn/other/unknown.
+    """
+    if decision_text is None:
+        return "unknown"
+    text = decision_text.lower()
+    if "withdraw" in text:
+        return "withdrawn"
+    if "oral" in text:
+        return "oral"
+    if "poster" in text or "spotlight" in text:
+        return "poster"
+    if "reject" in text:
+        return "reject"
+    return "other"
+
+
+def classify_status_from_venue(venue_text: str | None) -> str:
+    """Classify submission status from venue text.
+
+    Args:
+        venue_text: Venue string from submission content.
+
+    Returns:
+        One of oral/poster/reject/withdrawn/other/unknown.
+    """
+    if venue_text is None:
+        return "unknown"
+    text = venue_text.lower()
+    if "withdraw" in text:
+        return "withdrawn"
+    if "oral" in text:
+        return "oral"
+    if "poster" in text or "spotlight" in text:
+        return "poster"
+    if "reject" in text:
+        return "reject"
+    return "other"
+
+
+def get_submission_status(submission: dict[str, Any]) -> tuple[str, str | None]:
+    """Resolve submission status with decision and venue fallback.
+
+    Args:
+        submission: One submission note.
+
+    Returns:
+        A tuple of (status, decision_text).
+    """
+    details = submission.get("details", {})
+    replies = details.get("replies", [])
+    if not isinstance(replies, list):
+        replies = []
+    decision_text = extract_decision_text_from_replies(replies)
+    status_from_decision = classify_submission_status(decision_text)
+    if status_from_decision not in {"unknown", "other"}:
+        return status_from_decision, decision_text
+
+    content = submission.get("content", {})
+    venue_text: str | None = None
+    if isinstance(content, dict):
+        venue_value = extract_content_field(content, "venue")
+        if venue_value is not None:
+            venue_text = str(venue_value)
+    status_from_venue = classify_status_from_venue(venue_text)
+    return status_from_venue, decision_text
+
+
+def select_submissions_by_status(
+    submissions: list[dict[str, Any]],
+    per_status: int,
+) -> list[dict[str, Any]]:
+    """Select balanced subset by status buckets.
+
+    Args:
+        submissions: All crawled submissions.
+        per_status: Number of papers to keep per status bucket.
+
+    Returns:
+        Selected submissions.
+    """
+    target_statuses: tuple[str, ...] = ("oral", "poster", "reject", "withdrawn")
+    counters: dict[str, int] = {status: 0 for status in target_statuses}
+    selected: list[dict[str, Any]] = []
+
+    for submission in submissions:
+        status, _ = get_submission_status(submission)
+        if status not in counters:
+            continue
+        if counters[status] >= per_status:
+            continue
+        counters[status] += 1
+        selected.append(submission)
+        if all(count >= per_status for count in counters.values()):
+            break
+
+    LOGGER.info("Selected by status counters: %s", counters)
+    return selected
+
+
+def fetch_submissions_by_status_tabs(
+    session: requests.Session,
+    venue_id: str,
+    per_status: int,
+    page_size: int,
+) -> list[dict[str, Any]]:
+    """Fetch submissions using status-style venue filters like OpenReview tabs.
+
+    Args:
+        session: HTTP session.
+        venue_id: Venue id, e.g. ICLR.cc/2026/Conference.
+        per_status: Number of papers per status.
+        page_size: API page size.
+
+    Returns:
+        Aggregated selected submissions.
+    """
+    submission_invitation = f"{venue_id}/-/Submission"
+    # These labels use OpenReview venue values used by ICLR tabs.
+    status_to_venue_labels: dict[str, tuple[str, ...]] = {
+        "oral": (f"ICLR {venue_id.split('/')[1]} Oral",),
+        "poster": (f"ICLR {venue_id.split('/')[1]} Poster", f"ICLR {venue_id.split('/')[1]} Spotlight"),
+        "reject": (
+            f"Submitted to ICLR {venue_id.split('/')[1]}",
+        ),
+        "withdrawn": (
+            f"ICLR {venue_id.split('/')[1]} Conference Withdrawn Submission",
+        ),
+    }
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    counters: dict[str, int] = {status: 0 for status in status_to_venue_labels}
+
+    for status, venue_labels in status_to_venue_labels.items():
+        for venue_label in venue_labels:
+            remaining = per_status - counters[status]
+            if remaining <= 0:
+                break
+            notes = paged_notes(
+                session=session,
+                invitation=submission_invitation,
+                details="replies",
+                page_size=page_size,
+                max_items=remaining,
+                extra_params={"content.venue": venue_label},
+            )
+            for note in notes:
+                note_id = str(note.get("id", ""))
+                if note_id in selected_ids:
+                    continue
+                selected_ids.add(note_id)
+                selected.append(note)
+                counters[status] += 1
+                if counters[status] >= per_status:
+                    break
+
+    LOGGER.info("Selected by tab-like venue filters: %s", counters)
+    return selected
+
+
+def fetch_submissions_by_openreview_tabs(
+    session: requests.Session,
+    venue_id: str,
+    per_tab: int,
+    page_size: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Fetch submissions by OpenReview UI tab semantics.
+
+    Args:
+        session: HTTP session.
+        venue_id: Venue id, e.g. ICLR.cc/2026/Conference.
+        per_tab: Number of papers to fetch per tab.
+        page_size: API page size.
+
+    Returns:
+        Mapping from tab name to list of submissions.
+    """
+    year_token = venue_id.split("/")[1]
+    submission_invitation = f"{venue_id}/-/Submission"
+    rejected_venue_id = get_group_content_value(session, venue_id, "rejected_venue_id")
+    withdrawn_venue_id = get_group_content_value(session, venue_id, "withdrawn_venue_id")
+    desk_rejected_venue_id = get_group_content_value(session, venue_id, "desk_rejected_venue_id")
+    if rejected_venue_id is None:
+        rejected_venue_id = f"{venue_id}/Rejected_Submission"
+    if withdrawn_venue_id is None:
+        withdrawn_venue_id = f"{venue_id}/Withdrawn_Submission"
+    if desk_rejected_venue_id is None:
+        desk_rejected_venue_id = f"{venue_id}/Desk_Rejected_Submission"
+
+    # Strict tab-driven retrieval: do not use local fallback classification.
+    # Values are aligned with ICLR 2026 venue tags shown by OpenReview API.
+    tab_to_filters: dict[str, list[dict[str, Any]]] = {
+        "accept_oral": [{"content.venue": f"ICLR {year_token} Oral"}],
+        "accept_poster": [
+            {"content.venue": f"ICLR {year_token} Poster"},
+            {"content.venue": f"ICLR {year_token} Spotlight"},
+        ],
+        "reject": [{"content.venueid": rejected_venue_id}],
+        "withdrawn_submissions": [{"content.venueid": withdrawn_venue_id}],
+        "desk_rejected_submissions": [{"content.venueid": desk_rejected_venue_id}],
+    }
+    tab_samples: dict[str, list[dict[str, Any]]] = {}
+    for tab_name, filters in tab_to_filters.items():
+        selected: list[dict[str, Any]] = []
+        selected_ids: set[str] = set()
+        for filter_params in filters:
+            remaining = per_tab - len(selected)
+            if remaining <= 0:
+                break
+            notes = paged_notes(
+                session=session,
+                invitation=submission_invitation,
+                details="replies",
+                page_size=page_size,
+                max_items=remaining,
+                extra_params=filter_params,
+            )
+            for note in notes:
+                note_id = str(note.get("id", ""))
+                if note_id in selected_ids:
+                    continue
+                selected_ids.add(note_id)
+                selected.append(note)
+                if len(selected) >= per_tab:
+                    break
+        tab_samples[tab_name] = selected
+
+    # "Recent Activity" tab is time-ordered latest submissions/updates.
+    recent_activity = paged_notes(
+        session=session,
+        invitation=submission_invitation,
+        details="replies",
+        page_size=page_size,
+        max_items=per_tab,
+        extra_params={"sort": "tmdate:desc"},
+    )
+    tab_samples["recent_activity"] = recent_activity
+
+    LOGGER.info(
+        "Selected by OpenReview tabs: %s",
+        {tab: len(items) for tab, items in tab_samples.items()},
+    )
+    return tab_samples
+
+
 def crawl_iclr(config: CrawlConfig) -> list[dict[str, Any]]:
     """Crawl ICLR submissions with review/comment data.
 
@@ -578,6 +918,20 @@ def crawl_iclr(config: CrawlConfig) -> list[dict[str, Any]]:
         max_items=config.max_papers,
     )
     LOGGER.info("Found %d submissions for %s", len(submissions), venue_id)
+
+    if config.per_status is not None:
+        tab_selected_submissions = fetch_submissions_by_status_tabs(
+            session=session,
+            venue_id=venue_id,
+            per_status=config.per_status,
+            page_size=config.page_size,
+        )
+        if tab_selected_submissions:
+            submissions = tab_selected_submissions
+            LOGGER.info("Using %d submissions from tab-style venue filters", len(submissions))
+        else:
+            submissions = select_submissions_by_status(submissions, config.per_status)
+            LOGGER.info("Using %d submissions after fallback per-status sampling", len(submissions))
 
     papers: list[dict[str, Any]] = []
 
@@ -608,6 +962,7 @@ def crawl_iclr(config: CrawlConfig) -> list[dict[str, Any]]:
         reviews, comments = split_replies_by_type(replies)
         editorial_signals = extract_editorial_signals(replies)
         discussion_views = build_discussion_views(replies)
+        status, decision_text = get_submission_status(submission)
         papers.append(
             {
                 "paper_id": submission.get("id"),
@@ -616,6 +971,8 @@ def crawl_iclr(config: CrawlConfig) -> list[dict[str, Any]]:
                 "title": normalized_submission_content.get("title"),
                 "abstract": normalized_submission_content.get("abstract"),
                 "keywords": normalized_submission_content.get("keywords"),
+                "decision": decision_text,
+                "status": status,
                 "pdf_url": pdf_url,
                 "pdf_local_path": pdf_local_path,
                 "pdf_download_status": pdf_download_status,
@@ -676,6 +1033,134 @@ def crawl_iclr(config: CrawlConfig) -> list[dict[str, Any]]:
             }
         )
     return papers
+
+
+def crawl_iclr_by_tabs(config: CrawlConfig) -> dict[str, list[dict[str, Any]]]:
+    """Crawl ICLR submissions grouped by OpenReview tab categories.
+
+    Args:
+        config: Crawl configuration.
+
+    Returns:
+        Mapping of tab name to crawled paper bundles.
+    """
+    if config.per_tab is None:
+        return {}
+
+    venue_id: str = f"ICLR.cc/{config.year}/Conference"
+    session = create_session()
+    tab_submissions = fetch_submissions_by_openreview_tabs(
+        session=session,
+        venue_id=venue_id,
+        per_tab=config.per_tab,
+        page_size=config.page_size,
+    )
+
+    tab_papers: dict[str, list[dict[str, Any]]] = {}
+    for tab_name, submissions in tab_submissions.items():
+        papers: list[dict[str, Any]] = []
+        for submission in submissions:
+            forum_id = str(submission.get("forum", ""))
+            normalized_submission_content = normalize_content(submission.get("content", {}))
+            pdf_url = extract_pdf_url(normalized_submission_content)
+            pdf_local_path: str | None = None
+            pdf_download_status: str | None = None
+            if config.download_pdf and pdf_url is not None:
+                paper_id = str(submission.get("id", forum_id or "paper_unknown"))
+                target_path = config.pdf_dir / f"{paper_id}.pdf"
+                pdf_download_status = download_pdf_file(
+                    session=session,
+                    pdf_url=pdf_url,
+                    output_path=target_path,
+                    retry=config.retry,
+                    sleep_seconds=config.sleep_seconds,
+                )
+                pdf_local_path = target_path.as_posix()
+                if config.sleep_seconds > 0:
+                    time.sleep(config.sleep_seconds)
+
+            details = submission.get("details", {})
+            replies = details.get("replies", [])
+            if not isinstance(replies, list):
+                replies = []
+            reviews, comments = split_replies_by_type(replies)
+            editorial_signals = extract_editorial_signals(replies)
+            discussion_views = build_discussion_views(replies)
+            status, decision_text = get_submission_status(submission)
+            papers.append(
+                {
+                    "tab": tab_name,
+                    "paper_id": submission.get("id"),
+                    "forum_id": forum_id,
+                    "number": submission.get("number"),
+                    "title": normalized_submission_content.get("title"),
+                    "abstract": normalized_submission_content.get("abstract"),
+                    "keywords": normalized_submission_content.get("keywords"),
+                    "decision": decision_text,
+                    "status": status,
+                    "pdf_url": pdf_url,
+                    "pdf_local_path": pdf_local_path,
+                    "pdf_download_status": pdf_download_status,
+                    "submission_content": normalized_submission_content,
+                    "editorial_signals": editorial_signals,
+                    "all_replies": discussion_views["all_replies"],
+                    "author_responses": discussion_views["author_responses"],
+                    "meta_reviews": discussion_views["meta_reviews"],
+                    "review_notes": discussion_views["review_notes"],
+                    "reviews": [
+                        {
+                            "id": note.get("id"),
+                            "forum": note.get("forum"),
+                            "replyto": note.get("replyto"),
+                            "invitation": note.get("invitation"),
+                            "score": extract_score(note.get("content", {})),
+                            "soundness_score": extract_content_field(note.get("content", {}), "soundness"),
+                            "soundness": describe_review_metric(
+                                "soundness", extract_content_field(note.get("content", {}), "soundness")
+                            ),
+                            "presentation_score": extract_content_field(note.get("content", {}), "presentation"),
+                            "presentation": describe_review_metric(
+                                "presentation", extract_content_field(note.get("content", {}), "presentation")
+                            ),
+                            "contribution_score": extract_content_field(note.get("content", {}), "contribution"),
+                            "contribution": describe_review_metric(
+                                "contribution", extract_content_field(note.get("content", {}), "contribution")
+                            ),
+                            "rating_score": extract_content_field(note.get("content", {}), "rating"),
+                            "rating": describe_review_metric(
+                                "rating", extract_content_field(note.get("content", {}), "rating")
+                            ),
+                            "confidence_score": extract_content_field(note.get("content", {}), "confidence"),
+                            "confidence": describe_review_metric(
+                                "confidence", extract_content_field(note.get("content", {}), "confidence")
+                            ),
+                            "raw_content": enrich_metric_descriptions(
+                                normalize_content(note.get("content", {}))
+                            ),
+                            "content": enrich_metric_descriptions(
+                                normalize_content(note.get("content", {}))
+                            ),
+                            "tcdate": note.get("tcdate"),
+                        }
+                        for note in reviews
+                    ],
+                    "comments": [
+                        {
+                            "id": note.get("id"),
+                            "forum": note.get("forum"),
+                            "replyto": note.get("replyto"),
+                            "invitation": note.get("invitation"),
+                            "content": enrich_metric_descriptions(
+                                normalize_content(note.get("content", {}))
+                            ),
+                            "tcdate": note.get("tcdate"),
+                        }
+                        for note in comments
+                    ],
+                }
+            )
+        tab_papers[tab_name] = papers
+    return tab_papers
 
 
 def build_pdf_text_mapping_record(paper: dict[str, Any]) -> dict[str, Any]:
@@ -787,6 +1272,21 @@ def parse_args() -> CrawlConfig:
         default=None,
         help="Optional JSONL path to save PDF-text mapping records.",
     )
+    parser.add_argument(
+        "--per-status",
+        type=int,
+        default=None,
+        help="Sample N papers per status: oral/poster/reject/withdrawn.",
+    )
+    parser.add_argument(
+        "--per-tab",
+        type=int,
+        default=None,
+        help=(
+            "Sample N papers per OpenReview tab: accept_oral, accept_poster, reject, "
+            "withdrawn_submissions, desk_rejected_submissions, recent_activity."
+        ),
+    )
     args = parser.parse_args()
     return CrawlConfig(
         year=args.year,
@@ -798,6 +1298,8 @@ def parse_args() -> CrawlConfig:
         sleep_seconds=args.sleep_seconds,
         retry=args.retry,
         mapping_output=args.mapping_output,
+        per_status=args.per_status,
+        per_tab=args.per_tab,
     )
 
 
@@ -805,6 +1307,25 @@ def main() -> None:
     """Run the crawler and persist results to disk."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     config = parse_args()
+    if config.per_tab is not None:
+        tab_papers = crawl_iclr_by_tabs(config)
+        total_count = sum(len(items) for items in tab_papers.values())
+        config.output.write_text(
+            json.dumps(
+                {
+                    "conference": f"ICLR {config.year}",
+                    "paper_count": total_count,
+                    "tab_counts": {tab: len(items) for tab, items in tab_papers.items()},
+                    "tabs": tab_papers,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        LOGGER.info("Saved %d tab-grouped papers to %s", total_count, config.output.as_posix())
+        return
+
     papers = crawl_iclr(config)
     config.output.write_text(
         json.dumps(
