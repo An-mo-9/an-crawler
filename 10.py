@@ -1217,6 +1217,18 @@ def write_mapping_jsonl(mapping_output: Path, papers: list[dict[str, Any]]) -> N
     mapping_output.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
+def write_papers_jsonl(output_path: Path, papers: list[dict[str, Any]]) -> None:
+    """Write paper records as JSONL.
+
+    Args:
+        output_path: Target JSONL file path.
+        papers: Paper records to write.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(paper, ensure_ascii=False) for paper in papers]
+    output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
 def parse_args() -> CrawlConfig:
     """Parse CLI arguments.
 
@@ -1310,20 +1322,28 @@ def main() -> None:
     if config.per_tab is not None:
         tab_papers = crawl_iclr_by_tabs(config)
         total_count = sum(len(items) for items in tab_papers.values())
-        config.output.write_text(
-            json.dumps(
-                {
-                    "conference": f"ICLR {config.year}",
-                    "paper_count": total_count,
-                    "tab_counts": {tab: len(items) for tab, items in tab_papers.items()},
-                    "tabs": tab_papers,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        LOGGER.info("Saved %d tab-grouped papers to %s", total_count, config.output.as_posix())
+        flat_papers = [paper for papers in tab_papers.values() for paper in papers]
+        if config.output.suffix.lower() == ".jsonl":
+            write_papers_jsonl(config.output, flat_papers)
+            LOGGER.info("Saved %d tab-grouped papers as JSONL to %s", total_count, config.output.as_posix())
+        else:
+            config.output.write_text(
+                json.dumps(
+                    {
+                        "conference": f"ICLR {config.year}",
+                        "paper_count": total_count,
+                        "tab_counts": {tab: len(items) for tab, items in tab_papers.items()},
+                        "tabs": tab_papers,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            LOGGER.info("Saved %d tab-grouped papers to %s", total_count, config.output.as_posix())
+        if config.mapping_output is not None:
+            write_mapping_jsonl(config.mapping_output, flat_papers)
+            LOGGER.info("Saved mapping JSONL to %s", config.mapping_output.as_posix())
         return
 
     papers = crawl_iclr(config)
