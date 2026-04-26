@@ -854,12 +854,13 @@ def fetch_submissions_by_openreview_tabs(
         "desk_rejected_submissions": [{"content.venueid": desk_rejected_venue_id}],
     }
     tab_samples: dict[str, list[dict[str, Any]]] = {}
+    is_unbounded = per_tab <= 0
     for tab_name, filters in tab_to_filters.items():
         selected: list[dict[str, Any]] = []
         selected_ids: set[str] = set()
         for filter_params in filters:
-            remaining = per_tab - len(selected)
-            if remaining <= 0:
+            remaining = None if is_unbounded else per_tab - len(selected)
+            if (not is_unbounded) and remaining <= 0:
                 break
             notes = paged_notes(
                 session=session,
@@ -875,7 +876,7 @@ def fetch_submissions_by_openreview_tabs(
                     continue
                 selected_ids.add(note_id)
                 selected.append(note)
-                if len(selected) >= per_tab:
+                if (not is_unbounded) and len(selected) >= per_tab:
                     break
         tab_samples[tab_name] = selected
 
@@ -885,7 +886,7 @@ def fetch_submissions_by_openreview_tabs(
         invitation=submission_invitation,
         details="replies",
         page_size=page_size,
-        max_items=per_tab,
+        max_items=None if is_unbounded else per_tab,
         extra_params={"sort": "tmdate:desc"},
     )
     tab_samples["recent_activity"] = recent_activity
@@ -1296,7 +1297,8 @@ def parse_args() -> CrawlConfig:
         default=None,
         help=(
             "Sample N papers per OpenReview tab: accept_oral, accept_poster, reject, "
-            "withdrawn_submissions, desk_rejected_submissions, recent_activity."
+            "withdrawn_submissions, desk_rejected_submissions, recent_activity. "
+            "Use 0 for all papers in each tab."
         ),
     )
     args = parser.parse_args()
